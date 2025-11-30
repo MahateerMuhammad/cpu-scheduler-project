@@ -20,7 +20,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("CPU Scheduler Team");
 MODULE_DESCRIPTION("Custom CPU Scheduler with Priority + Aging");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.2");
 
 /* Scheduler parameters (modifiable via /proc) */
 static int time_quantum_ms = 100;
@@ -56,8 +56,10 @@ struct custom_pcb {
     unsigned long wait_time_ms;
     unsigned long turnaround_time_ms;
     unsigned long last_update_jiffies;
+    unsigned long wakeup_time_jiffies; /* For waiting state */
     
     struct list_head list;      /* For ready queue */
+    struct list_head global_list; /* For all_processes list */
 };
 
 /* Ready queue with spinlock protection */
@@ -90,7 +92,7 @@ static spinlock_t sched_lock;
 static struct task_struct *scheduler_thread = NULL;
 static bool scheduler_running = false;
 static LIST_HEAD(all_processes);
-static int next_pid = 1;
+static atomic_t next_pid = ATOMIC_INIT(1);  /* FIXED: Use atomic for thread safety */
 
 /* Proc filesystem entry */
 static struct proc_dir_entry *proc_entry = NULL;
@@ -102,6 +104,31 @@ static struct custom_pcb *select_next_process(void);
 static void update_statistics(void);
 static void enqueue_process(struct custom_pcb *proc);
 static struct custom_pcb *dequeue_process(void);
+static void check_waiting_processes(void);
+
+/*
+ * Check for processes that should wake up from waiting
+ */
+static void check_waiting_processes(void)
+{
+    struct custom_pcb *proc;
+    unsigned long flags;
+    
+    spin_lock_irqsave(&sched_lock, flags);
+    
+    list_for_each_entry(proc, &all_processes, global_list) {
+        if (proc->state == PROC_WAITING) {
+            if (time_after_eq(jiffies, proc->wakeup_time_jiffies)) {
+                proc->state = PROC_READY;
+                proc->last_update_jiffies = jiffies;
+                enqueue_process(proc);
+                pr_info("custom_scheduler: Process %d (%s) woke up\n", proc->pid, proc->name);
+            }
+        }
+    }
+    
+    spin_unlock_irqrestore(&sched_lock, flags);
+}
 
 /*
  * Enqueue process to ready queue (priority-based insertion)
@@ -227,7 +254,7 @@ static void update_statistics(void)
     stats.waiting_processes = 0;
     stats.terminated_processes = 0;
     
-    list_for_each_entry(proc, &all_processes, list) {
+    list_for_each_entry(proc, &all_processes, global_list) {
         count++;
         
         switch (proc->state) {
@@ -273,20 +300,26 @@ static void update_statistics(void)
  */
 static int scheduler_thread_fn(void *data)
 {
+    struct custom_pcb *proc;
+    struct custom_pcb *p;
     unsigned long flags;
+    int exec_time;
     
     pr_info("custom_scheduler: Scheduler thread started\n");
     
     while (!kthread_should_stop() && scheduler_running) {
+        /* Check for waking processes */
+        check_waiting_processes();
+
         /* Apply aging to prevent starvation */
         apply_aging();
         
         /* Select next process */
-        struct custom_pcb *proc = select_next_process();
+        proc = select_next_process();
         
         if (proc) {
             /* Simulate execution for time quantum */
-            int exec_time = min(time_quantum_ms, proc->remaining_time_ms);
+            exec_time = min(time_quantum_ms, proc->remaining_time_ms);
             
             msleep(exec_time);
             
@@ -296,16 +329,22 @@ static int scheduler_thread_fn(void *data)
             stats.total_cpu_time_ms += exec_time;
             
             /* Update wait time for ready processes */
-            struct custom_pcb *p;
-            list_for_each_entry(p, &all_processes, list) {
+            list_for_each_entry(p, &all_processes, global_list) {
                 if (p->state == PROC_READY) {
                     p->wait_time_ms += exec_time;
                 }
             }
             
+            /* Check if process was moved to WAITING state (e.g. by user command) */
+            if (proc->state == PROC_WAITING) {
+                current_proc = NULL;
+                pr_info("custom_scheduler: Process %d (%s) is waiting, not re-enqueuing\n", 
+                        proc->pid, proc->name);
+            }
             /* Check if process completed */
-            if (proc->remaining_time_ms <= 0) {
+            else if (proc->remaining_time_ms <= 0) {
                 proc->state = PROC_TERMINATED;
+                proc->turnaround_time_ms = jiffies_to_msecs(jiffies - proc->arrival_time_jiffies);
                 current_proc = NULL;
                 pr_info("custom_scheduler: Process %d (%s) terminated\n", 
                         proc->pid, proc->name);
@@ -339,6 +378,7 @@ static int sched_stats_show(struct seq_file *m, void *v)
 {
     struct custom_pcb *proc;
     unsigned long flags;
+    const char *state_str;
     
     seq_printf(m, "=== Custom CPU Scheduler Statistics ===\n\n");
     
@@ -366,22 +406,24 @@ static int sched_stats_show(struct seq_file *m, void *v)
     
     spin_lock_irqsave(&sched_lock, flags);
     
-    list_for_each_entry(proc, &all_processes, list) {
-        const char *state_str;
-        
-        switch (proc->state) {
-        case PROC_NEW:        state_str = "NEW"; break;
-        case PROC_READY:      state_str = "READY"; break;
-        case PROC_RUNNING:    state_str = "RUNNING"; break;
-        case PROC_WAITING:    state_str = "WAITING"; break;
-        case PROC_TERMINATED: state_str = "TERM"; break;
-        default:              state_str = "UNKNOWN"; break;
+    if (list_empty(&all_processes)) {
+        seq_printf(m, "No processes in list\n");
+    } else {
+        list_for_each_entry(proc, &all_processes, global_list) {
+            switch (proc->state) {
+            case PROC_NEW:        state_str = "NEW"; break;
+            case PROC_READY:      state_str = "READY"; break;
+            case PROC_RUNNING:    state_str = "RUNNING"; break;
+            case PROC_WAITING:    state_str = "WAITING"; break;
+            case PROC_TERMINATED: state_str = "TERM"; break;
+            default:              state_str = "UNKNOWN"; break;
+            }
+            
+            seq_printf(m, "%-6d %-20s %-10s %-8d %-8d %-10d %-10lu\n",
+                       proc->pid, proc->name, state_str,
+                       proc->base_priority, proc->effective_priority,
+                       proc->remaining_time_ms, proc->wait_time_ms);
         }
-        
-        seq_printf(m, "%-6d %-20s %-10s %-8d %-8d %-10d %-10lu\n",
-                   proc->pid, proc->name, state_str,
-                   proc->base_priority, proc->effective_priority,
-                   proc->remaining_time_ms, proc->wait_time_ms);
     }
     
     spin_unlock_irqrestore(&sched_lock, flags);
@@ -418,52 +460,100 @@ static ssize_t sched_stats_write(struct file *file, const char __user *buffer,
     kbuffer[count] = '\0';
     
     /* Parse command */
-    if (sscanf(kbuffer, "%s %s %d %d", cmd, name, &burst_time, &priority) != 4) {
-        pr_info("custom_scheduler: Invalid command format. Use: NEW <name> <burst> <prio>\n");
+    if (sscanf(kbuffer, "%7s", cmd) != 1)
         return -EINVAL;
-    }
-    
-    if (strcmp(cmd, "NEW") != 0) {
+        
+    if (strcmp(cmd, "NEW") == 0) {
+        if (sscanf(kbuffer, "%*s %31s %d %d", name, &burst_time, &priority) != 3) {
+            pr_info("custom_scheduler: Invalid NEW format. Buffer: '%s'\n", kbuffer);
+            return -EINVAL;
+        }
+        
+        /* Validate parameters */
+        if (burst_time <= 0 || priority < 0 || priority > 10) {
+            pr_info("custom_scheduler: Invalid parameters. Burst > 0, Priority 0-10\n");
+            return -EINVAL;
+        }
+        
+        /* Create new process */
+        proc = kmalloc(sizeof(struct custom_pcb), GFP_KERNEL);
+        if (!proc)
+            return -ENOMEM;
+        
+        memset(proc, 0, sizeof(struct custom_pcb));
+            
+        proc->pid = atomic_inc_return(&next_pid);
+        strncpy(proc->name, name, 31);
+        proc->name[31] = '\0';
+        proc->base_priority = priority;
+        proc->effective_priority = priority;
+        proc->burst_time_ms = burst_time;
+        proc->remaining_time_ms = burst_time;
+        proc->state = PROC_READY;
+        
+        proc->arrival_time_jiffies = jiffies;
+        proc->last_update_jiffies = jiffies;
+        proc->wait_time_ms = 0;
+        proc->turnaround_time_ms = 0;
+        
+        INIT_LIST_HEAD(&proc->list);
+        INIT_LIST_HEAD(&proc->global_list);
+        
+        /* Add to lists */
+        spin_lock_irqsave(&sched_lock, flags);
+        list_add_tail(&proc->global_list, &all_processes);
+        spin_unlock_irqrestore(&sched_lock, flags);
+        
+        enqueue_process(proc);
+        
+        pr_info("custom_scheduler: Created process %d (%s) with burst %d ms, prio %d\n",
+                proc->pid, proc->name, burst_time, priority);
+                
+    } else if (strcmp(cmd, "WAIT") == 0) {
+        int pid, wait_ms;
+        struct custom_pcb *p;
+        bool found = false;
+        
+        if (sscanf(kbuffer, "%*s %d %d", &pid, &wait_ms) != 2) {
+            pr_info("custom_scheduler: Invalid WAIT format. Use: WAIT <pid> <ms>\n");
+            return -EINVAL;
+        }
+        
+        spin_lock_irqsave(&sched_lock, flags);
+        list_for_each_entry(p, &all_processes, global_list) {
+            if (p->pid == pid) {
+                if (p->state == PROC_RUNNING || p->state == PROC_READY) {
+                    /* If running, preempt it */
+                    if (p->state == PROC_RUNNING) {
+                        current_proc = NULL;
+                    } else {
+                        /* If ready, remove from ready queue */
+                        unsigned long rq_flags;
+                        spin_lock_irqsave(&ready_q.lock, rq_flags);
+                        list_del(&p->list);
+                        ready_q.count--;
+                        spin_unlock_irqrestore(&ready_q.lock, rq_flags);
+                    }
+                    
+                    p->state = PROC_WAITING;
+                    p->wakeup_time_jiffies = jiffies + msecs_to_jiffies(wait_ms);
+                    pr_info("custom_scheduler: Process %d put to sleep for %d ms\n", pid, wait_ms);
+                } else {
+                    pr_info("custom_scheduler: Process %d is not RUNNING or READY\n", pid);
+                }
+                found = true;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&sched_lock, flags);
+        
+        if (!found)
+            pr_info("custom_scheduler: Process %d not found\n", pid);
+            
+    } else {
         pr_info("custom_scheduler: Unknown command: %s\n", cmd);
         return -EINVAL;
     }
-    
-    /* Validate parameters */
-    if (burst_time <= 0 || priority < 0 || priority > 10) {
-        pr_info("custom_scheduler: Invalid parameters. Burst > 0, Priority 0-10\n");
-        return -EINVAL;
-    }
-    
-    /* Create new process */
-    proc = kmalloc(sizeof(struct custom_pcb), GFP_KERNEL);
-    if (!proc)
-        return -ENOMEM;
-        
-    proc->pid = next_pid++;
-    strncpy(proc->name, name, 31);
-    proc->name[31] = '\0';
-    proc->base_priority = priority;
-    proc->effective_priority = priority;
-    proc->burst_time_ms = burst_time;
-    proc->remaining_time_ms = burst_time;
-    proc->state = PROC_READY;
-    
-    proc->arrival_time_jiffies = jiffies;
-    proc->last_update_jiffies = jiffies;
-    proc->wait_time_ms = 0;
-    proc->turnaround_time_ms = 0;
-    
-    INIT_LIST_HEAD(&proc->list);
-    
-    /* Add to lists */
-    spin_lock_irqsave(&sched_lock, flags);
-    list_add_tail(&proc->list, &all_processes);
-    spin_unlock_irqrestore(&sched_lock, flags);
-    
-    enqueue_process(proc);
-    
-    pr_info("custom_scheduler: Created process %d (%s) with burst %d ms, prio %d\n",
-            proc->pid, proc->name, burst_time, priority);
             
     return count;
 }
@@ -481,12 +571,15 @@ static const struct proc_ops sched_stats_fops = {
  */
 static int __init custom_scheduler_init(void)
 {
-    pr_info("custom_scheduler: Initializing Custom CPU Scheduler module\n");
+    pr_info("custom_scheduler: Initializing Custom CPU Scheduler module v1.2\n");
     
     /* Initialize ready queue */
     INIT_LIST_HEAD(&ready_q.head);
     spin_lock_init(&ready_q.lock);
     ready_q.count = 0;
+    
+    /* Initialize global process list explicitly */
+    INIT_LIST_HEAD(&all_processes);
     
     /* Initialize scheduler lock */
     spin_lock_init(&sched_lock);
@@ -494,8 +587,8 @@ static int __init custom_scheduler_init(void)
     /* Initialize statistics */
     memset(&stats, 0, sizeof(stats));
     
-    /* Create /proc/sched_stats entry */
-    proc_entry = proc_create("sched_stats", 0444, NULL, &sched_stats_fops);
+    /* Create /proc/sched_stats entry with write permissions */
+    proc_entry = proc_create("sched_stats", 0666, NULL, &sched_stats_fops);  /* FIXED: Changed to 0666 */
     if (!proc_entry) {
         pr_err("custom_scheduler: Failed to create /proc/sched_stats\n");
         return -ENOMEM;
@@ -545,8 +638,8 @@ static void __exit custom_scheduler_exit(void)
     /* Free all process structures */
     spin_lock_irqsave(&sched_lock, flags);
     
-    list_for_each_entry_safe(proc, tmp, &all_processes, list) {
-        list_del(&proc->list);
+    list_for_each_entry_safe(proc, tmp, &all_processes, global_list) {
+        list_del(&proc->global_list);
         kfree(proc);
     }
     
