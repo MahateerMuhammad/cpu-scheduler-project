@@ -1,0 +1,40 @@
+# Build output
+build/
+*.o
+*.a
+*.so
+*.dylib
+cpu_scheduler
+
+# IDE
+.vscode/.history
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Qt
+*.pro.user
+*.autosave
+moc_*
+ui_*
+qrc_*
+
+# Logs
+*.log
+sched_stats.log
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Docker
+.dockerignore

@@ -1,0 +1,1 @@
+cmd_/workspace/kernel_module/custom_scheduler.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /workspace/kernel_module/custom_scheduler.ko /workspace/kernel_module/custom_scheduler.o /workspace/kernel_module/custom_scheduler.mod.o;  true
